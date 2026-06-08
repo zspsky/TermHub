@@ -1,0 +1,14 @@
+[
+  {
+    "id": "server-a",
+    "name": "Server A",
+    "base_url": "http://192.168.1.21:7860",
+    "token": "change-me"
+  },
+  {
+    "id": "server-b",
+    "name": "Server B",
+    "base_url": "http://192.168.1.22:7860",
+    "token": "change-me"
+  }
+]

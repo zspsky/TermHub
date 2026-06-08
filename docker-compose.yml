@@ -1,0 +1,63 @@
+services:
+  task-terminal-manager:
+    build:
+      context: .
+    image: task-terminal-manager:local
+    container_name: task-terminal-manager
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    pid: host
+    ipc: host
+    environment:
+      TASK_MANAGER_HOST: 127.0.0.1
+      TASK_MANAGER_PORT: ${TASK_MANAGER_INTERNAL_PORT:-7861}
+      TASK_TTYD_HOST: 127.0.0.1
+      TASK_PORT_START: "7700"
+      TASK_PORT_END: "7799"
+      TTYD_VERSION: 1.7.7
+      TTYD_BASE_PATH_PREFIX: /ttyd
+      TASK_MANAGER_BASE_DIR: ${TASK_MANAGER_BASE_DIR:-${PWD}}
+      TASK_MANAGER_NODES_FILE: ${TASK_MANAGER_NODES_FILE:-${TASK_MANAGER_BASE_DIR:-${PWD}}/data/nodes.json}
+      TASK_MANAGER_TOKEN: ""
+      TASK_MANAGER_PASSWORD: ""
+      TASK_MANAGER_ALLOWED_CLIENTS: ${TASK_MANAGER_ALLOWED_CLIENTS:-}
+      TTYD_BIN: ${TASK_MANAGER_BASE_DIR:-${PWD}}/tools/ttyd/1.7.7/ttyd
+      HOME: /root
+      TERM: xterm-256color
+    volumes:
+      - ${TASK_MANAGER_BASE_DIR:-${PWD}}:${TASK_MANAGER_BASE_DIR:-${PWD}}
+
+  caddy:
+    image: caddy:2
+    container_name: task-terminal-caddy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      CADDY_HTTP_PORT: ${CADDY_HTTP_PORT:-7860}
+      CADDY_AUTH_USER: ${CADDY_AUTH_USER:-admin}
+      CADDY_AUTH_PASSWORD: ${CADDY_AUTH_PASSWORD:-}
+      CADDY_BASIC_AUTH_HASH: ${CADDY_BASIC_AUTH_HASH:-}
+      TASK_MANAGER_INTERNAL_PORT: ${TASK_MANAGER_INTERNAL_PORT:-7861}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ -n "$${CADDY_BASIC_AUTH_HASH}" ]; then
+          export CADDY_AUTH_HASH="$${CADDY_BASIC_AUTH_HASH}"
+        elif [ -n "$${CADDY_AUTH_PASSWORD}" ]; then
+          export CADDY_AUTH_HASH="$$(caddy hash-password --plaintext "$${CADDY_AUTH_PASSWORD}")"
+        else
+          echo "set CADDY_AUTH_PASSWORD or CADDY_BASIC_AUTH_HASH in .env" >&2
+          exit 1
+        fi
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy/nodes.caddy:/etc/caddy/nodes.caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
