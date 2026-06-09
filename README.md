@@ -1,5 +1,7 @@
 # TermHub
 
+[English](README.md) | [中文](README.zh.md)
+
 TermHub is a multi-server web terminal task manager for `tmux` and `ttyd`.
 
 It lets one control node create, view, start, stop, restart, and open terminal
