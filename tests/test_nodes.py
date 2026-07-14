@@ -218,6 +218,7 @@ def test_render_index_lists_tasks_from_all_nodes(monkeypatch):
         ]
 
     monkeypatch.setattr(server, "load_nodes", fake_load_nodes)
+    monkeypatch.setattr(server, "load_mode", lambda: "controller")
     monkeypatch.setattr(server, "list_node_tasks", fake_list_node_tasks)
 
     html = server.render_index(None).decode()

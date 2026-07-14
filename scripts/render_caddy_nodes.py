@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 NODES_FILE = ROOT / "data" / "nodes.json"
+SETTINGS_FILE = ROOT / "data" / "settings.json"
 OUT_DIR = ROOT / "data" / "caddy"
 OUT_FILE = OUT_DIR / "nodes.caddy"
 SAFE_ID = re.compile(r"[^A-Za-z0-9_]")
@@ -21,7 +22,8 @@ def route_name(node_id: str) -> str:
 
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    if not NODES_FILE.exists():
+    mode = json.loads(SETTINGS_FILE.read_text()).get("mode") if SETTINGS_FILE.exists() else None
+    if mode != "controller" or not NODES_FILE.exists():
         OUT_FILE.write_text("# no remote nodes configured\n")
         return
 

@@ -12,6 +12,8 @@ Caddy with Basic Auth.
 ## Features
 
 - Central dashboard for tasks across many servers
+- First-login choice between controller and agent modes
+- Controller-side node registration from the web UI
 - Per-node task execution with local `tmux` and `ttyd`
 - Caddy-protected public entry point on `:7860`
 - Manager and ttyd ports bound to `127.0.0.1`
@@ -89,6 +91,12 @@ http://SERVER_IP:7860
 ```
 
 Sign in with `CADDY_AUTH_USER` and `CADDY_AUTH_PASSWORD`.
+On the first login, choose a mode:
+
+- `Controller` shows local and remote nodes and can add remote nodes in the web UI.
+- `Agent` only shows the local node and its tasks.
+
+The mode can be changed later from the selector in the top-right corner.
 
 ## Multi-Node Setup
 
@@ -116,6 +124,9 @@ Example:
 
 `token` must be the remote node's plaintext `CADDY_AUTH_PASSWORD`. TermHub uses
 it for server-to-server Basic Auth.
+
+You can also add nodes from `Machines -> Add agent` in controller mode. The web
+form updates `data/nodes.json` and refreshes the generated Caddy routes.
 
 After editing `data/nodes.json`, regenerate Caddy node routes and restart:
 

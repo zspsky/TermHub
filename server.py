@@ -7,12 +7,14 @@ import binascii
 import ipaddress
 import json
 import os
+import re
 import signal
 import shutil
 import socket
 import sqlite3
 import subprocess
 import time
+import threading
 import urllib.error
 import urllib.request
 import uuid
@@ -30,6 +32,7 @@ LOG_DIR = DATA_DIR / "logs"
 SOCKET_DIR = DATA_DIR / "sockets"
 DB_PATH = DATA_DIR / "tasks.sqlite3"
 NODES_FILE = Path(os.environ.get("TASK_MANAGER_NODES_FILE", str(DATA_DIR / "nodes.json")))
+SETTINGS_FILE = DATA_DIR / "settings.json"
 MANAGER_TOKEN = os.environ.get("TASK_MANAGER_TOKEN", "")
 MANAGER_PASSWORD = os.environ.get("TASK_MANAGER_PASSWORD", MANAGER_TOKEN)
 ALLOWED_CLIENTS = os.environ.get("TASK_MANAGER_ALLOWED_CLIENTS", "")
@@ -41,6 +44,8 @@ TASK_TTYD_HOST = os.environ.get("TASK_TTYD_HOST", "0.0.0.0")
 TASK_PORT_START = int(os.environ.get("TASK_PORT_START", "7700"))
 TASK_PORT_END = int(os.environ.get("TASK_PORT_END", "7799"))
 TTYD_BASE_PATH_PREFIX = os.environ.get("TTYD_BASE_PATH_PREFIX", "")
+MODES = {"controller", "agent"}
+NODE_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 SCHEMA = """
@@ -165,6 +170,42 @@ def local_node() -> Node:
     return Node(id="local", name="Local", local=True)
 
 
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    temp.replace(path)
+
+
+def load_mode(path: Path | str = SETTINGS_FILE) -> str | None:
+    settings_path = Path(path)
+    if not settings_path.exists():
+        return None
+    mode = json.loads(settings_path.read_text()).get("mode")
+    if mode not in MODES:
+        raise ValueError("mode must be controller or agent")
+    return mode
+
+
+def save_mode(mode: str, path: Path | str = SETTINGS_FILE) -> None:
+    if mode not in MODES:
+        raise ValueError("mode must be controller or agent")
+    write_json(Path(path), {"mode": mode})
+
+
+def validate_node(node_id: str, name: str, base_url: str, token: str) -> Node:
+    clean_id = node_id.strip()
+    clean_url = base_url.strip().rstrip("/")
+    parsed = urlparse(clean_url)
+    if not NODE_ID_RE.fullmatch(clean_id):
+        raise ValueError("node id may only contain letters, numbers, _ and -")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("base URL must be an absolute HTTP(S) URL")
+    if not token.strip():
+        raise ValueError("token is required")
+    return Node(clean_id, name.strip() or clean_id, clean_url, token.strip())
+
+
 def load_nodes(path: Path | str = NODES_FILE) -> list[Node]:
     nodes = [local_node()]
     nodes_path = Path(path)
@@ -178,16 +219,69 @@ def load_nodes(path: Path | str = NODES_FILE) -> list[Node]:
     for index, raw in enumerate(raw_nodes, start=1):
         if not isinstance(raw, dict):
             raise ValueError(f"node entry {index} must be an object")
-        node_id = str(raw.get("id", "")).strip()
-        name = str(raw.get("name", node_id)).strip() or node_id
-        base_url = str(raw.get("base_url", "")).strip().rstrip("/")
-        token = str(raw.get("token", "")).strip()
-        if not node_id:
-            raise ValueError(f"node entry {index} missing id")
-        if not base_url:
-            raise ValueError(f"node {node_id} missing base_url")
-        nodes.append(Node(id=node_id, name=name, base_url=base_url, token=token))
+        try:
+            nodes.append(
+                validate_node(
+                    str(raw.get("id", "")),
+                    str(raw.get("name", "")),
+                    str(raw.get("base_url", "")),
+                    str(raw.get("token", "")),
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(f"node entry {index}: {exc}") from exc
     return nodes
+
+
+def nodes_for_mode(nodes: list[Node], mode: str | None) -> list[Node]:
+    return nodes if mode == "controller" else [node for node in nodes if node.local]
+
+
+def visible_nodes() -> list[Node]:
+    return nodes_for_mode(load_nodes(), load_mode())
+
+
+def add_node(
+    node_id: str,
+    name: str,
+    base_url: str,
+    token: str,
+    path: Path | str = NODES_FILE,
+) -> Node:
+    nodes_path = Path(path)
+    existing = load_nodes(nodes_path)[1:]
+    node = validate_node(node_id, name, base_url, token)
+    if any(item.id == node.id for item in existing):
+        raise ValueError(f"node {node.id} already exists")
+    payload = [
+        {"id": item.id, "name": item.name, "base_url": item.base_url, "token": item.token}
+        for item in [*existing, node]
+    ]
+    write_json(nodes_path, payload)
+    return node
+
+
+def refresh_caddy_routes() -> None:
+    result = subprocess.run(
+        ["python3", "scripts/render_caddy_nodes.py"],
+        cwd=BASE_DIR,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout).strip() or "failed to render Caddy routes")
+
+    def restart() -> None:
+        subprocess.run(
+            ["docker", "compose", "restart", "caddy"],
+            cwd=BASE_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    timer = threading.Timer(0.5, restart)
+    timer.daemon = True
+    timer.start()
 
 
 def node_by_id(node_id: str, nodes: list[Node] | None = None) -> Node | None:
@@ -468,6 +562,24 @@ def esc(value: Any) -> str:
 
 
 def page(title: str, body: str) -> bytes:
+    mode = load_mode()
+    if mode:
+        controller_selected = " selected" if mode == "controller" else ""
+        agent_selected = " selected" if mode == "agent" else ""
+        links = '<a class="btn" href="/">任务</a>'
+        if mode == "controller":
+            links += '<a class="btn" href="/nodes">机器</a><a class="btn primary" href="/nodes">新建任务</a>'
+        else:
+            links += '<a class="btn primary" href="/nodes/local/tasks/new">新建任务</a>'
+        navigation = f"""{links}
+      <form class="inline" method="post" action="/settings/mode">
+        <select name="mode" aria-label="运行模式" onchange="this.form.submit()">
+          <option value="controller"{controller_selected}>控端</option>
+          <option value="agent"{agent_selected}>被控端</option>
+        </select>
+      </form>"""
+    else:
+        navigation = ""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -570,7 +682,7 @@ def page(title: str, body: str) -> bytes:
       max-width: 760px;
     }}
     label {{ display: grid; gap: 6px; color: var(--muted); font-size: 13px; }}
-    input[type="text"] {{
+    input[type="text"], input[type="password"], select {{
       min-height: 38px;
       border: 1px solid var(--border);
       border-radius: 6px;
@@ -579,6 +691,9 @@ def page(title: str, body: str) -> bytes:
       color: var(--text);
       background: white;
     }}
+    nav select {{ min-height: 34px; padding: 0 8px; }}
+    .choices {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+    .choice {{ display: flex; align-items: center; gap: 7px; min-height: 42px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); }}
     .check {{ display: flex; align-items: center; gap: 8px; color: var(--text); }}
     .terminal-frame {{
       width: 100%;
@@ -642,11 +757,9 @@ def page(title: str, body: str) -> bytes:
 </head>
 <body>
   <header>
-    <div class="brand">任务终端管理</div>
+    <div class="brand">TermHub</div>
     <nav class="actions">
-      <a class="btn" href="/">任务</a>
-      <a class="btn" href="/nodes">机器</a>
-      <a class="btn primary" href="/nodes">新建任务</a>
+      {navigation}
     </nav>
   </header>
   <main class="shell">{body}</main>
@@ -657,7 +770,7 @@ def page(title: str, body: str) -> bytes:
 def render_index(handler: BaseHTTPRequestHandler) -> bytes:
     entries = []
     errors = []
-    for node in load_nodes():
+    for node in visible_nodes():
         try:
             for task in list_node_tasks(node):
                 entries.append((node, task))
@@ -739,6 +852,51 @@ def render_new(error: str = "") -> bytes:
     )
 
 
+def render_setup(error: str = "") -> bytes:
+    error_html = f'<div class="error">{esc(error)}</div>' if error else ""
+    current = load_mode()
+    controller_checked = " checked" if current != "agent" else ""
+    agent_checked = " checked" if current == "agent" else ""
+    return page(
+        "选择运行模式",
+        f"""{error_html}
+<form class="form" method="post" action="/settings/mode">
+  <div style="font-size:18px;font-weight:650">选择运行模式</div>
+  <div class="choices">
+    <label class="choice"><input type="radio" name="mode" value="controller"{controller_checked}>控端</label>
+    <label class="choice"><input type="radio" name="mode" value="agent"{agent_checked}>被控端</label>
+  </div>
+  <div><button class="btn primary" type="submit">保存</button></div>
+</form>""",
+    )
+
+
+def render_add_node(error: str = "") -> bytes:
+    error_html = f'<div class="error">{esc(error)}</div>' if error else ""
+    return page(
+        "添加被控端",
+        f"""{error_html}
+<form class="form" method="post" action="/nodes">
+  <label>节点 ID
+    <input type="text" name="id" required>
+  </label>
+  <label>名称
+    <input type="text" name="name" required>
+  </label>
+  <label>地址
+    <input type="text" name="base_url" placeholder="http://192.168.1.21:7860" required>
+  </label>
+  <label>密码
+    <input type="password" name="token" required>
+  </label>
+  <div class="actions">
+    <button class="btn primary" type="submit">添加</button>
+    <a class="btn" href="/nodes">取消</a>
+  </div>
+</form>""",
+    )
+
+
 def render_nodes(nodes: list[Node]) -> bytes:
     body_rows = []
     for node in nodes:
@@ -755,6 +913,7 @@ def render_nodes(nodes: list[Node]) -> bytes:
         "机器",
         f"""<section class="toolbar">
   <div style="font-size:18px;font-weight:650">机器</div>
+  {'<a class="btn primary" href="/nodes/new">添加被控端</a>' if load_mode() == 'controller' else ''}
 </section>
 <table>
   <thead><tr><th>名称</th><th>ID</th><th>地址</th><th>操作</th></tr></thead>
@@ -991,15 +1150,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self.request_allowed(path):
                 return
-            if path == "/":
+            mode = load_mode()
+            if mode is None and path not in ("/setup", "/health") and not path.startswith("/api/"):
+                self.redirect("/setup")
+                return
+            if path == "/setup":
+                self.html(render_setup())
+            elif path == "/":
                 self.html(render_index(self))
             elif path == "/health":
                 self.text("ok\n")
             elif path == "/nodes":
-                self.html(render_nodes(load_nodes()))
+                self.html(render_nodes(visible_nodes()))
+            elif path == "/nodes/new":
+                if mode != "controller":
+                    self.not_found()
+                    return
+                self.html(render_add_node())
             elif path.startswith("/nodes/"):
                 parts = path.split("/")
-                node = node_by_id(parts[2] if len(parts) > 2 else "")
+                node = node_by_id(parts[2] if len(parts) > 2 else "", visible_nodes())
                 if not node:
                     self.not_found()
                     return
@@ -1043,9 +1213,32 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self.request_allowed(path):
                 return
+            if path == "/settings/mode":
+                form = self.read_form()
+                save_mode(form.get("mode", [""])[0])
+                refresh_caddy_routes()
+                self.redirect("/")
+                return
+            if load_mode() is None:
+                self.redirect("/setup")
+                return
+            if path == "/nodes":
+                if load_mode() != "controller":
+                    self.not_found()
+                    return
+                form = self.read_form()
+                add_node(
+                    form.get("id", [""])[0],
+                    form.get("name", [""])[0],
+                    form.get("base_url", [""])[0],
+                    form.get("token", [""])[0],
+                )
+                refresh_caddy_routes()
+                self.redirect("/nodes")
+                return
             if path.startswith("/nodes/"):
                 parts = path.split("/")
-                node = node_by_id(parts[2] if len(parts) > 2 else "")
+                node = node_by_id(parts[2] if len(parts) > 2 else "", visible_nodes())
                 if not node:
                     self.not_found()
                     return
@@ -1148,6 +1341,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             if path == "/tasks":
                 self.html(render_new(str(exc)), status=HTTPStatus.BAD_REQUEST)
+            elif path == "/nodes":
+                self.html(render_add_node(str(exc)), status=HTTPStatus.BAD_REQUEST)
+            elif path == "/settings/mode":
+                self.html(render_setup(str(exc)), status=HTTPStatus.BAD_REQUEST)
             else:
                 self.error(str(exc))
 
